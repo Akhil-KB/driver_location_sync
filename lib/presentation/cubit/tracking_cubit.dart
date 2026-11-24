@@ -24,26 +24,31 @@ class TrackingCubit extends Cubit<TrackingState> {
   StreamSubscription<List<LocationRecord>>? _recordsSubscription;
   StreamSubscription<LocationRecord>? _locationSubscription;
   LocationSource? _activeSource;
+  Future<void> _ingestQueue = Future<void>.value();
 
   Future<void> initialize() async {
     await _syncService.initialize();
     _recordsSubscription = _syncService.recordsStream.listen((records) {
+      if (isClosed) {
+        return;
+      }
       emit(
         state.copyWith(
           records: records,
           isOnline: _syncService.isOnline,
-          clearMessage: true,
         ),
       );
     });
 
     final initial = await _syncService.currentRecords();
-    emit(
-      state.copyWith(
-        records: initial,
-        isOnline: _syncService.isOnline,
-      ),
-    );
+    if (!isClosed) {
+      emit(
+        state.copyWith(
+          records: initial,
+          isOnline: _syncService.isOnline,
+        ),
+      );
+    }
   }
 
   void setMode(TrackingMode mode) {
@@ -80,8 +85,10 @@ class TrackingCubit extends Cubit<TrackingState> {
     );
 
     _locationSubscription = source.watchLocations().listen(
-      (record) async {
-        await _syncService.ingest(record);
+      (record) {
+        _ingestQueue = _ingestQueue.then((_) async {
+          await _syncService.ingest(record);
+        });
       },
       onError: (Object error) {
         emit(
@@ -106,14 +113,27 @@ class TrackingCubit extends Cubit<TrackingState> {
 
   Future<void> syncNow() async {
     emit(state.copyWith(isSyncing: true, clearMessage: true));
-    await _syncService.syncPending();
-    emit(
-      state.copyWith(
-        isSyncing: false,
-        isOnline: _syncService.isOnline,
-        message: 'Manual sync completed.',
-      ),
-    );
+    try {
+      await _syncService.syncPending();
+      if (!isClosed) {
+        emit(
+          state.copyWith(
+            isSyncing: false,
+            isOnline: _syncService.isOnline,
+            message: 'Manual sync completed.',
+          ),
+        );
+      }
+    } catch (error) {
+      if (!isClosed) {
+        emit(
+          state.copyWith(
+            isSyncing: false,
+            message: 'Sync failed: $error',
+          ),
+        );
+      }
+    }
   }
 
   Future<void> _stopLocationStream() async {
@@ -121,6 +141,7 @@ class TrackingCubit extends Cubit<TrackingState> {
     _locationSubscription = null;
     await _activeSource?.stop();
     _activeSource = null;
+    await _ingestQueue;
   }
 
   @override

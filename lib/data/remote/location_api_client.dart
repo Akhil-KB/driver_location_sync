@@ -1,20 +1,26 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
 import 'package:driver_location_sync/models/location_record.dart';
 import 'package:http/http.dart' as http;
 
+enum UploadFailureKind { network, server, unknown }
+
 class LocationUploadException implements Exception {
-  LocationUploadException(this.message);
+  LocationUploadException(
+    this.message, {
+    this.kind = UploadFailureKind.unknown,
+  });
 
   final String message;
+  final UploadFailureKind kind;
+
+  bool get isConnectivityIssue => kind == UploadFailureKind.network;
 
   @override
   String toString() => message;
 }
 
-/// Uploads location points to a mock REST endpoint.
 abstract class LocationApiClient {
   Future<void> upload(LocationRecord record);
 
@@ -44,31 +50,45 @@ class MockHttpLocationApiClient implements LocationApiClient {
   @override
   Future<void> upload(LocationRecord record) async {
     if (forceOffline) {
-      throw LocationUploadException('Network unavailable');
+      throw LocationUploadException(
+        'Network unavailable',
+        kind: UploadFailureKind.network,
+      );
     }
 
-    // Occasional failures exercise retry handling.
     if (_random.nextDouble() < failureRate) {
-      throw LocationUploadException('Simulated upload failure');
+      throw LocationUploadException(
+        'Transient upload failure',
+        kind: UploadFailureKind.server,
+      );
     }
 
-    // Same id already accepted -> treat as success.
     if (_acceptedIds.contains(record.id)) {
       return;
     }
 
-    final response = await _httpClient.post(
-      Uri.parse(endpoint),
-      headers: {
-        'Content-Type': 'application/json',
-        'Idempotency-Key': record.id,
-      },
-      body: jsonEncode(record.toApiPayload()),
-    );
+    try {
+      final response = await _httpClient.post(
+        Uri.parse(endpoint),
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': record.id,
+        },
+        body: jsonEncode(record.toApiPayload()),
+      );
 
-    if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw LocationUploadException(
+          'Upload failed with status ${response.statusCode}',
+          kind: UploadFailureKind.server,
+        );
+      }
+    } on LocationUploadException {
+      rethrow;
+    } catch (error) {
       throw LocationUploadException(
-        'Upload failed with status ${response.statusCode}',
+        'Network unavailable: $error',
+        kind: UploadFailureKind.network,
       );
     }
 
@@ -80,17 +100,19 @@ class MockHttpLocationApiClient implements LocationApiClient {
   }
 }
 
-/// In-memory client for tests.
 class InMemoryLocationApiClient implements LocationApiClient {
   InMemoryLocationApiClient({
     this.failUntilAttempt = 0,
     this.alwaysFail = false,
+    this.networkFailOnce = false,
   });
 
   final int failUntilAttempt;
   final bool alwaysFail;
+  final bool networkFailOnce;
   final Map<String, int> _attemptsById = <String, int>{};
   final Set<String> _acceptedIds = <String>{};
+  bool _networkFailed = false;
 
   @override
   Set<String> get acceptedIds => Set.unmodifiable(_acceptedIds);
@@ -100,8 +122,19 @@ class InMemoryLocationApiClient implements LocationApiClient {
     final attempt = (_attemptsById[record.id] ?? 0) + 1;
     _attemptsById[record.id] = attempt;
 
+    if (networkFailOnce && !_networkFailed) {
+      _networkFailed = true;
+      throw LocationUploadException(
+        'Network unavailable',
+        kind: UploadFailureKind.network,
+      );
+    }
+
     if (alwaysFail || attempt <= failUntilAttempt) {
-      throw LocationUploadException('Upload failed on attempt $attempt');
+      throw LocationUploadException(
+        'Upload failed on attempt $attempt',
+        kind: UploadFailureKind.server,
+      );
     }
 
     if (_acceptedIds.contains(record.id)) {

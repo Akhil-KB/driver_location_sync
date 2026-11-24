@@ -21,6 +21,11 @@ class LocationRecord {
   final int retryCount;
   final String? lastError;
 
+  bool get needsSync =>
+      status == SyncStatus.pending ||
+      status == SyncStatus.failed ||
+      status == SyncStatus.syncing;
+
   bool get isPending =>
       status == SyncStatus.pending || status == SyncStatus.failed;
 

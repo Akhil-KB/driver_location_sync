@@ -1,15 +1,17 @@
 # Driver Location Sync
 
-Flutter app for driver GPS tracking with offline storage and sync when connectivity returns.
+Flutter sample for driver GPS tracking with offline-first storage and reliable sync.
 
-## Features
+Focus areas: architecture, offline reliability, synchronization, and testable problem-solving.
 
-- Start / stop location tracking (simulated GPS or device GPS)
-- Save location points locally when offline
-- Keep pending points after app restart
-- Auto-sync to a mock REST API with retries
-- Avoid duplicate uploads with stable record IDs
-- Cubit-based structure: UI, sync logic, local storage, and API kept separate
+## What it does
+
+- Start / stop tracking (simulated GPS or device GPS)
+- Persist every location point locally before any upload attempt
+- Keep pending points across app restarts
+- Auto-sync when connectivity returns
+- Retry failed uploads with backoff
+- Block duplicate uploads with stable record IDs (`Idempotency-Key`)
 
 ## Setup
 
@@ -20,78 +22,67 @@ flutter run
 ```
 
 ```bash
-flutter run -d macos   # simulated GPS works well on desktop
-flutter run            # Android / iOS device or emulator
-```
-
-## Usage
-
-1. Open the app (simulated GPS is selected by default).
-2. Tap **Start** to begin capturing points.
-3. Turn on airplane mode to verify offline storage.
-4. Close and reopen the app — pending points should still be there.
-5. Go online again and tap **Sync** (or wait for automatic sync).
-
-## Structure
-
-```text
-lib/
-  models/
-  data/
-    local/           # JSON persistence
-    remote/          # mock REST client
-    location/        # device + simulated GPS
-    connectivity/
-  domain/            # sync / retry logic
-  presentation/
-    cubit/
-    pages/
+flutter run -d macos
+flutter run
 ```
 
 ## Architecture
 
-- `TrackingCubit` handles UI state
-- `LocationSyncService` handles ingest, persist, sync, and retries
-- Local store is a JSON file for simplicity
-- Mock uploads go to `https://httpbin.org/post` and fail randomly so retry behavior is easy to see
-- Each captured point gets a UUID that stays the same across retries
+```text
+presentation/   TrackingCubit + UI
+domain/         LocationSyncService (offline queue + sync rules)
+data/
+  local/        atomic JSON persistence
+  remote/       mock REST client
+  location/     device / simulated GPS
+  connectivity/ online-offline signals
+```
 
-## Background location tracking
+Design choices:
 
-Background service code is not included in this sample. Approach for production:
+- **UI does not talk to storage or HTTP directly.** Cubit only starts GPS and forwards points into the sync service.
+- **Offline-first write path.** `ingest()` always writes disk first. Upload happens only after persistence succeeds.
+- **Single-flight sync.** Concurrent sync requests share one in-flight job. Points that arrive mid-sync mark the queue dirty and get drained before sync exits.
+- **Crash recovery.** Records left in `syncing` are reset to `pending` on startup so an interrupted upload is retried with the same id.
+- **Idempotent uploads.** The client UUID is reused for every retry and sent as `Idempotency-Key`.
+- **Typed failures.** Network loss stops the batch; transient server failures retry with exponential backoff.
 
-### Android
+## Offline + sync flow
 
-- Request fine location, then background location on Android 10+
-- Keep a foreground service with a persistent notification during an active trip
-- Write every point to local storage first, then upload when online
-- After process death, restore from the local queue and restart tracking when the driver opens the app
-- Limits: background access is restricted without a foreground service; OEM battery savers can still throttle updates
-
-### iOS
-
-- Start with When In Use, request Always only if continuous background tracking is required
-- Enable `UIBackgroundModes = location`
-- Persist locally first; sync when the network is available
-- If the user force-closes the app, continuous updates stop until relaunch (significant-change / region monitoring can help wake the app)
-- Limits: Always permission is reviewed carefully; iOS may coalesce updates to save power
-
-### Shared approach
-
-1. Capture locations in a long-running background capability
-2. Append to a local queue with stable IDs
-3. Sync over REST when online
-4. Mark synced only after a successful response
-5. Retry with backoff using the same ID
-
-## Limitations
-
-- Simulated GPS is the default path
-- Local storage is a single JSON file
-- No map UI or auth layer in this sample
+1. Capture location point with a stable UUID
+2. Append/upsert into local store
+3. If offline, leave as `pending`
+4. When online, upload oldest pending first
+5. Mark `synced` only after a successful response
+6. On failure, store error + retry count and try again later
 
 ## Tests
 
 ```bash
 flutter test
 ```
+
+Covered cases:
+
+- offline persistence across restart
+- interrupted `syncing` recovery
+- retry after transient failure
+- duplicate id prevention
+- connectivity loss during a sync batch
+- points ingested while sync is running
+
+## Background location notes
+
+Background service implementation is not part of this sample.
+
+**Android:** foreground service + notification for active trips; persist locally first; sync when network returns; OEM battery savers can still throttle updates.
+
+**iOS:** When In Use first, Always only if required; `UIBackgroundModes = location`; force-quit stops continuous updates until relaunch.
+
+Shared rule: local queue with stable ids is the source of truth; network sync is eventual.
+
+## Limitations
+
+- Simulated GPS is the default path
+- Local store is a JSON file (good enough for this sample size)
+- Mock API randomly fails so retry behavior is visible

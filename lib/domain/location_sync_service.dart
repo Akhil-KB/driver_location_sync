@@ -5,7 +5,10 @@ import 'package:driver_location_sync/data/local/location_local_store.dart';
 import 'package:driver_location_sync/data/remote/location_api_client.dart';
 import 'package:driver_location_sync/models/location_record.dart';
 
-/// Persists location points and syncs them when online.
+/// Offline-first sync:
+/// 1) persist every point locally
+/// 2) upload only after disk write succeeds
+/// 3) retry with the same id until acknowledged
 class LocationSyncService {
   LocationSyncService({
     required LocationLocalStore localStore,
@@ -26,12 +29,14 @@ class LocationSyncService {
   StreamSubscription<bool>? _connectivitySubscription;
   Future<void>? _activeSync;
   bool _isOnline = true;
+  bool _dirtyDuringSync = false;
 
   Stream<List<LocationRecord>> get recordsStream => _recordsController.stream;
 
   bool get isOnline => _isOnline;
 
   Future<void> initialize() async {
+    await _localStore.recoverInterruptedSyncs();
     _isOnline = await _connectivityMonitor.isOnline;
     await _emitRecords();
 
@@ -51,7 +56,6 @@ class LocationSyncService {
   }
 
   Future<void> ingest(LocationRecord record) async {
-    // Skip if this id was already stored.
     final existing = await _localStore.loadAll();
     if (existing.any((item) => item.id == record.id)) {
       return;
@@ -63,7 +67,11 @@ class LocationSyncService {
     await _emitRecords();
 
     if (_isOnline) {
-      await syncPending();
+      if (_activeSync != null) {
+        _dirtyDuringSync = true;
+      } else {
+        await syncPending();
+      }
     }
   }
 
@@ -74,57 +82,68 @@ class LocationSyncService {
   }
 
   Future<void> _runSync() async {
-    if (!await _connectivityMonitor.isOnline) {
-      _isOnline = false;
-      await _emitRecords();
-      return;
-    }
+    do {
+      _dirtyDuringSync = false;
 
-    _isOnline = true;
-    final pending = await _localStore.pendingRecords();
-    for (final original in pending) {
-      var current = original;
-      while (current.isPending && current.retryCount < maxRetries) {
-        if (!await _connectivityMonitor.isOnline) {
-          _isOnline = false;
-          await _emitRecords();
-          return;
-        }
-
-        final syncing =
-            current.copyWith(status: SyncStatus.syncing, clearError: true);
-        await _localStore.upsert(syncing);
+      if (!await _connectivityMonitor.isOnline) {
+        _isOnline = false;
         await _emitRecords();
+        return;
+      }
 
-        try {
-          await _apiClient.upload(syncing);
-          current =
-              syncing.copyWith(status: SyncStatus.synced, clearError: true);
-          await _localStore.upsert(current);
-          await _emitRecords();
-          break;
-        } catch (error) {
-          current = current.copyWith(
-            status: SyncStatus.failed,
-            retryCount: current.retryCount + 1,
-            lastError: error.toString(),
-          );
-          await _localStore.upsert(current);
-          await _emitRecords();
+      _isOnline = true;
+      final pending = await _localStore.pendingRecords();
+      for (final original in pending) {
+        var current = original;
 
-          if (error.toString().contains('Network unavailable')) {
+        while (current.isPending && current.retryCount < maxRetries) {
+          if (!await _connectivityMonitor.isOnline) {
             _isOnline = false;
+            await _emitRecords();
             return;
           }
 
-          if (current.retryCount < maxRetries) {
-            await Future<void>.delayed(
-              Duration(milliseconds: 100 * current.retryCount),
+          final syncing =
+              current.copyWith(status: SyncStatus.syncing, clearError: true);
+          await _localStore.upsert(syncing);
+          await _emitRecords();
+
+          try {
+            await _apiClient.upload(syncing);
+            current =
+                syncing.copyWith(status: SyncStatus.synced, clearError: true);
+            await _localStore.upsert(current);
+            await _emitRecords();
+            break;
+          } catch (error) {
+            final failure = error is LocationUploadException
+                ? error
+                : LocationUploadException(error.toString());
+
+            current = current.copyWith(
+              status: SyncStatus.failed,
+              retryCount: current.retryCount + 1,
+              lastError: failure.message,
             );
+            await _localStore.upsert(current);
+            await _emitRecords();
+
+            if (failure.isConnectivityIssue) {
+              _isOnline = false;
+              return;
+            }
+
+            if (current.retryCount < maxRetries) {
+              final delayMs = (150 * (1 << (current.retryCount - 1))).clamp(
+                150,
+                2000,
+              );
+              await Future<void>.delayed(Duration(milliseconds: delayMs));
+            }
           }
         }
       }
-    }
+    } while (_dirtyDuringSync);
 
     await _emitRecords();
   }
@@ -135,7 +154,7 @@ class LocationSyncService {
     final records = await _localStore.loadAll();
     records.sort((a, b) => b.capturedAt.compareTo(a.capturedAt));
     if (!_recordsController.isClosed) {
-      _recordsController.add(records);
+      _recordsController.add(List<LocationRecord>.unmodifiable(records));
     }
   }
 
