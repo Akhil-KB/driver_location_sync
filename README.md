@@ -13,6 +13,14 @@ Focus areas: architecture, offline reliability, synchronization, and testable pr
 - Retry failed uploads with backoff
 - Block duplicate uploads with stable record IDs (`Idempotency-Key`)
 
+## Demo
+
+Screen recording (Android emulator) with captions:
+
+[docs/demo.mp4](docs/demo.mp4)
+
+Shows simulated GPS tracking, offline pending queue, and sync drain when connectivity returns.
+
 ## Setup
 
 ```bash
